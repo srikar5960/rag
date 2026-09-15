@@ -4,6 +4,8 @@ import os
 
 load_dotenv()
 
+
+
 class ChatBot:
 
     def __init__(self, retriever):
@@ -11,53 +13,105 @@ class ChatBot:
         self.retriever = retriever
 
         self.llm = ChatGroq(
-            groq_api_key="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",
-            model_name="openai/gpt-oss-20b",
+            model="openai/gpt-oss-20b",
             temperature=0.1,
             max_tokens=1024
         )
 
     def ask(self, question):
 
-        # Retrieve relevant chunks
         retrieved_docs = self.retriever.retrieve(
             query=question,
-            top_k=3
+            candidate_k=20,
+            final_k=3
         )
 
-        # No documents found
         if not retrieved_docs:
-            return "I couldn't find relevant information in the uploaded document."
-
+            return {
+                "answer": (
+                    "I couldn't find relevant information "
+                    "in the uploaded document."
+                ),
+                "sources": []
+            }
 
         # Build context
         context = "\n\n".join(
-            doc["content"] for doc in retrieved_docs
+            doc["text"]
+            for doc in retrieved_docs
         )
 
-        # Prompt
+        # Generate answer
         prompt = f"""
-You are a helpful PDF assistant.
+    You are a helpful PDF assistant.
 
-Answer ONLY from the context provided.
+    Answer ONLY using the provided context.
 
-If the answer is not available in the context, say:
-"I couldn't find that information in the uploaded document."
+    Do not use outside knowledge.
 
-Context:
-{context}
+    If the answer cannot be found in the context, say:
 
-Question:
-{question}
+    "I couldn't find that information in the uploaded document."
 
-Answer:
-"""
+    Give a clear and direct answer.
 
-        response = self.llm.invoke(
-            prompt.format(
-                context=context,
-                query=question
+    Context:
+    ----------------
+    {context}
+    ----------------
+
+    Question:
+    {question}
+
+    Answer:
+    """
+
+        response = self.llm.invoke(prompt)
+
+        answer = response.content
+
+        # Build structured sources
+        sources = []
+
+        seen = set()
+
+        for doc in retrieved_docs:
+
+            metadata = doc.get(
+                "metadata",
+                {}
             )
-        )
 
-        return response.content
+            source = metadata.get(
+                "source",
+                "Unknown"
+            )
+
+            page = metadata.get(
+                "page_label",
+                metadata.get("page", "?")
+            )
+
+            filename = os.path.basename(
+                source
+            )
+
+            key = (
+                filename,
+                str(page)
+            )
+
+            if key not in seen:
+                seen.add(key)
+
+                sources.append({
+                    "file": filename,
+                    "page": int(page)
+                    if str(page).isdigit()
+                    else page
+                })
+
+        return {
+            "answer": answer,
+            "sources": sources
+        }

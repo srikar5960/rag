@@ -1,98 +1,394 @@
-###RAG Retriever
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 
-# Type hints for better code readability
-from typing import List, Dict, Any
 
-class RAGRetriever:
-    """Handles query-based retrieval from the vector store"""
+class BM25Retriever:
+
+    def __init__(self, documents):
+
+        self.documents = documents
+
+        tokenized_documents = [
+            self.tokenize(document)
+            for document in documents
+        ]
+
+        self.bm25 = BM25Okapi(
+            tokenized_documents
+        )
+
+    def tokenize(self, text):
+
+        return text.lower().split()
+
+    def search(self, query, top_k=20):
+
+        tokenized_query = self.tokenize(
+            query
+        )
+
+        scores = self.bm25.get_scores(
+            tokenized_query
+        )
+
+        ranked_indices = sorted(
+            range(len(scores)),
+            key=lambda i: scores[i],
+            reverse=True
+        )
+
+        results = []
+
+        for rank, index in enumerate(
+            ranked_indices[:top_k],
+            start=1
+        ):
+
+            results.append({
+                "text": self.documents[index],
+                "index": index,
+                "bm25_score": float(
+                    scores[index]
+                ),
+                "rank": rank
+            })
+
+        return results
+
+
+class HybridRetriever:
 
     def __init__(
         self,
         vector_store,
-        embedding_manager
+        embedding_manager,
+        documents
     ):
-        """
-        Initialize the retriever.
 
-        Args:
-            vector_store: Vector store containing document embeddings.
-            embedding_manager: Manager for generating query embeddings.
-        """
-
-        # Store the VectorStore object
         self.vector_store = vector_store
 
-        # Store the EmbeddingManager object
-        self.embedding_manager = embedding_manager
+        self.embedding_manager = (
+            embedding_manager
+        )
 
-    def retrieve(self,query: str,top_k: int = 5,score_threshold: float = 0.0) -> List[Dict[str, Any]]:
-        """
-        Retrieve relevant documents for a query.
+        self.documents = documents
 
-        Args:
-            query: User search query.
-            top_k: Number of top similar documents to retrieve.
-            score_threshold: Minimum similarity score required.
+        # BM25
+        self.bm25_retriever = BM25Retriever(
+            documents
+        )
 
-        Returns:
-            List of dictionaries containing retrieved documents and metadata.
-        """
+        # Cross Encoder
+        self.cross_encoder = CrossEncoder(
+            "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        )
 
-        # Display the query information
-        print(f"Retrieving documents for query: '{query}'")
-        print(f"Top K: {top_k}, Score Threshold: {score_threshold}")
+    # ==========================================
+    # Semantic Search
+    # ==========================================
 
-        # Generate embedding for the user query
-        query_embedding = self.embedding_manager.generate_embeddings([query])[0]
+    def semantic_search(
+        self,
+        query,
+        top_k=20
+    ):
 
-        try:
-            # Search the ChromaDB vector store
-            results = self.vector_store.collection.query(
-                query_embeddings=[query_embedding.tolist()],
-                n_results=top_k
+        query_embedding = (
+            self.embedding_manager
+            .generate_query_embedding(
+                query
+            )
+        )
+
+        return self.vector_store.search(
+            query_embedding,
+            top_k=top_k
+        )
+
+    # ==========================================
+    # BM25 Search
+    # ==========================================
+
+    def bm25_search(
+        self,
+        query,
+        top_k=20
+    ):
+
+        return self.bm25_retriever.search(
+            query,
+            top_k=top_k
+        )
+
+    # ==========================================
+    # RRF
+    # ==========================================
+
+    def reciprocal_rank_fusion(
+        self,
+        semantic_results,
+        bm25_results,
+        k=60
+    ):
+
+        fused_scores = {}
+
+        documents = {}
+
+        # --------------------------------------
+        # Semantic results
+        # --------------------------------------
+
+        for rank, result in enumerate(
+            semantic_results,
+            start=1
+        ):
+
+            index = result["index"]
+
+            documents[index] = result
+
+            fused_scores[index] = (
+                fused_scores.get(
+                    index,
+                    0
+                )
+                + 1 / (k + rank)
             )
 
-            # print(results)
+        # --------------------------------------
+        # BM25 results
+        # --------------------------------------
 
-            # Store retrieved documents
-            retrieved_docs = []
+        for rank, result in enumerate(
+            bm25_results,
+            start=1
+        ):
 
-            # Check whether documents were found
-            if results["documents"] and results["documents"][0]:
+            index = result["index"]
 
-                documents = results["documents"][0]
-                metadatas = results["metadatas"][0]
-                distances = results["distances"][0]
-                ids = results["ids"][0]
+            if index not in documents:
+                documents[index] = result
 
-                # Process each retrieved document
-                for i, (doc_id, document, metadata, distance) in enumerate(
-                    zip(ids, documents, metadatas, distances)
-                ):
+            fused_scores[index] = (
+                fused_scores.get(
+                    index,
+                    0
+                )
+                + 1 / (k + rank)
+            )
 
-                    # Convert cosine distance into similarity score
-                    # similarity_score = 1 - distance
+        # --------------------------------------
+        # Sort
+        # --------------------------------------
 
-                    # Apply similarity threshold
-                    if distance >= score_threshold:
+        ranked = sorted(
+            fused_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
 
-                        retrieved_docs.append({
-                            "id": doc_id,
-                            "content": document,
-                            "metadata": metadata,
-                            # "similarity_score": similarity_score,
-                            "distance": distance,
-                            "rank": i + 1
-                        })
+        results = []
 
-                print(f"Retrieved {len(retrieved_docs)} documents (after filtering)")
-                print(retrieved_docs)
+        for index, score in ranked:
 
-            else:
-                print("No documents found")
+            result = documents[index]
 
-            return retrieved_docs
+            results.append({
+                "text": result["text"],
+                "index": index,
+                "metadata": result.get("metadata", {}),
+                "rrf_score": score
+            })
 
-        except Exception as e:
-            print(f"Error during retrieval: {e}")
+        return results
+
+    # ==========================================
+    # Cross Encoder Reranking
+    # ==========================================
+
+    def rerank(
+        self,
+        query,
+        candidates,
+        top_k=5
+    ):
+
+        if not candidates:
             return []
+
+        pairs = [
+            [
+                query,
+                candidate["text"]
+            ]
+            for candidate in candidates
+        ]
+
+        scores = self.cross_encoder.predict(
+            pairs
+        )
+
+        for candidate, score in zip(
+            candidates,
+            scores
+        ):
+
+            candidate[
+                "rerank_score"
+            ] = float(score)
+
+        candidates.sort(
+            key=lambda x: x[
+                "rerank_score"
+            ],
+            reverse=True
+        )
+
+        return candidates[:top_k]
+
+    # ==========================================
+    # COMPLETE RETRIEVAL PIPELINE
+    # ==========================================
+
+    def retrieve(
+            self,
+            query,
+            candidate_k=20,
+            final_k=5
+    ):
+
+        print()
+        print("============================================")
+        print("RETRIEVAL DEBUG")
+        print("============================================")
+
+        print()
+        print("QUERY:")
+        print(query)
+
+        # ========================================================
+        # 1. Semantic Search
+        # ========================================================
+
+        semantic_results = (
+            self.semantic_search(
+                query,
+                top_k=candidate_k
+            )
+        )
+
+        print()
+        print("--------------------------------------------")
+        print("SEMANTIC SEARCH")
+        print("--------------------------------------------")
+
+        for result in semantic_results:
+            print(
+                f"Index: {result['index']} | "
+                f"Distance: {result.get('distance')}"
+            )
+
+            print(
+                f"Text: {result['text'][:150].replace(chr(10), ' ')}"
+            )
+
+            print()
+
+        # ========================================================
+        # 2. BM25 Search
+        # ========================================================
+
+        bm25_results = (
+            self.bm25_search(
+                query,
+                top_k=candidate_k
+            )
+        )
+
+        print()
+        print("--------------------------------------------")
+        print("BM25 SEARCH")
+        print("--------------------------------------------")
+
+        for result in bm25_results:
+            print(
+                f"Index: {result['index']} | "
+                f"BM25 Score: {result['bm25_score']}"
+            )
+
+            print(
+                f"Text: {result['text'][:150].replace(chr(10), ' ')}"
+            )
+
+            print()
+
+        # ========================================================
+        # 3. RRF
+        # ========================================================
+
+        hybrid_results = (
+            self.reciprocal_rank_fusion(
+                semantic_results,
+                bm25_results
+            )
+        )
+
+        print()
+        print("--------------------------------------------")
+        print("RRF RESULTS")
+        print("--------------------------------------------")
+
+        for result in hybrid_results[:candidate_k]:
+            print(
+                f"Index: {result['index']} | "
+                f"RRF Score: {result['rrf_score']}"
+            )
+
+            print(
+                f"Text: {result['text'][:150].replace(chr(10), ' ')}"
+            )
+
+            print()
+
+        # ========================================================
+        # 4. Cross Encoder
+        # ========================================================
+
+        rerank_candidates = (
+            hybrid_results[:candidate_k]
+        )
+
+        final_results = self.rerank(
+            query,
+            rerank_candidates,
+            top_k=final_k
+        )
+
+        print()
+        print("--------------------------------------------")
+        print("CROSS ENCODER RESULTS")
+        print("--------------------------------------------")
+
+        for result in final_results:
+            print(
+                f"Index: {result['index']} | "
+                f"RRF: {result['rrf_score']} | "
+                f"Cross Encoder: {result['rerank_score']}"
+            )
+
+            print(
+                f"Text: {result['text'][:150].replace(chr(10), ' ')}"
+            )
+
+            print()
+
+        # ========================================================
+        # Final
+        # ========================================================
+
+        print("============================================")
+        print("END RETRIEVAL DEBUG")
+        print("============================================")
+
+        return final_results

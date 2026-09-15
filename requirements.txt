@@ -17,3 +17,5 @@ pillow
 torch
 matplotlib
 rank-bm25
+
+python-dotenv

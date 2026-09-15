@@ -1,0 +1,13 @@
+.env
+
+.venv/
+
+__pycache__/
+*.py[cod]
+
+chroma_db/
+data1/vector_store/
+data/vector_store/
+
+
+notebook/
