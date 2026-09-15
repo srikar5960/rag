@@ -24,6 +24,6 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Run app/tests
+      - name: Run RAG Evaluation
         run: |
-          python app.py
+          python evaluation/evaluate.py
